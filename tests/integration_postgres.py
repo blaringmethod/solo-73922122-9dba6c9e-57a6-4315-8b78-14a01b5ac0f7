@@ -9,6 +9,10 @@ snapshot creation) that the SQLite-based integration_local.py cannot cover:
   P3. full round succeeds; curve matches an independent SQL computation
   P4. cancel mid-round -> cancelled, both sites released
   P5. idempotent create per round
+  P6. 200-case cap enforced even for direct SQL
+  P7. read racing a release is complete-or-refused (READ COMMITTED would
+      expose a half-deleted histogram without the snapshot lock)
+  P8. same-round resend after expiry/release is rejected; slot freed
 
 Run:  python tests/integration_postgres.py
 """
@@ -51,6 +55,18 @@ async def pg_cases(db: str) -> list[tuple[int, str]]:
         return [(r["days"], r["event"]) for r in rows]
     finally:
         await con.close()
+
+
+def pg_backdate_snapshot(db: str, snapshot_id: str) -> None:
+    """Force a snapshot's expiry into the past (simulates TTL expiry)."""
+    async def _run():
+        con = await asyncpg.connect(user="postgres", database=db, host=PG_DIR)
+        try:
+            await con.execute("UPDATE snapshots SET expires_at = now() - interval '1 hour' WHERE id = $1",
+                              snapshot_id)
+        finally:
+            await con.close()
+    asyncio.run(_run())
 
 
 def expected_curve_pg() -> list[tuple[int, int, int, float]]:
@@ -169,6 +185,43 @@ def main() -> int:
             await con.close()
 
     check("P6 200-case cap enforced for direct SQL inserts", asyncio.run(cap_check()))
+
+    # ---- P7: read racing a release is complete-or-refused ------------------
+    # On PostgreSQL READ COMMITTED, without the snapshot lock a reclaim could
+    # land between the liveness check and the histogram read and the site
+    # would answer with a zeroed histogram. Assert the contract directly.
+    import concurrent.futures as cf
+
+    interleave_ok, interleave_detail = True, ""
+    for i in range(15):
+        st, s_x = http("POST", f"{A}/snapshots", {"round_id": f"pg-race-{i}"})
+        sid_x = s_x["snapshot_id"]
+        with cf.ThreadPoolExecutor(max_workers=2) as ex:
+            f_read = ex.submit(http, "POST", f"{A}/snapshots/{sid_x}/aggregate", {"points": [1]})
+            f_del = ex.submit(http, "DELETE", f"{A}/snapshots/{sid_x}")
+            st_r, ag_x = f_read.result()
+            f_del.result()
+        if not (st_r == 404 or (st_r == 200 and ag_x["rows"][0]["n_risk"] == 160)):
+            interleave_ok, interleave_detail = False, f"iter {i}: {st_r} {ag_x}"
+    check("P7 read racing release is complete-or-refused on PostgreSQL",
+          interleave_ok, interleave_detail)
+
+    # ---- P8: same-round resend after expiry/release is rejected ------------
+    st, r8 = http("POST", f"{A}/snapshots", {"round_id": "pg-resend-1"})
+    st, r8b = http("POST", f"{A}/snapshots", {"round_id": "pg-resend-1"})
+    check("P8 resend while live returns the original id",
+          r8["snapshot_id"] == r8b["snapshot_id"], f"{r8} vs {r8b}")
+    pg_backdate_snapshot("site_a", r8["snapshot_id"])
+    st, r8c = http("POST", f"{A}/snapshots", {"round_id": "pg-resend-1"})
+    check("P8b resend after expiry rejected (409)", st == 409, f"got {st}: {r8c}")
+    st, dd = http("GET", f"{A}/snapshots/{r8['snapshot_id']}/death-days")
+    check("P8c expired snapshot refuses queries", st == 404, f"got {st}: {dd}")
+    st, r8d = http("POST", f"{A}/snapshots", {"round_id": "pg-resend-2"})
+    check("P8d freed slot usable by a new round", st == 201, f"got {st}: {r8d}")
+    http("DELETE", f"{A}/snapshots/{r8d['snapshot_id']}")
+    st, r8e = http("POST", f"{A}/snapshots", {"round_id": "pg-resend-2"})
+    check("P8e resend after release rejected (409)", st == 409, f"got {st}: {r8e}")
+    check("P8f no slots leaked", active_snapshots(A) == 0 and active_snapshots(B) == 0)
 
     print()
     if failures:

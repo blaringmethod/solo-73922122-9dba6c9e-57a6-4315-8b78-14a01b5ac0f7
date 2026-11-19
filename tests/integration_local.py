@@ -11,6 +11,10 @@ process, and exercises the federated KM workflow:
   F. direct SQL correction during computation is not blocked
   G. coordinator crash -> TTL auto-release -> restart -> recovery -> new round
   H. graceful coordinator stop releases in-flight snapshots
+  I. read/reclaim interleaving: queries are complete-or-refused, never
+     silently zeroed; a round whose snapshot is reclaimed mid-flight fails
+  J. same-round create resend: same id while live, 409 after expiry/release,
+     freed slot usable by a new round, rebuild allowed after retention
 
 A "crash" is simulated by freezing the coordinator's event loop (no cleanup
 code runs), which is exactly what a SIGKILL would look like to the sites.
@@ -20,6 +24,7 @@ Run:  python tests/integration_local.py
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures as cf
 import json
 import socket
 import sqlite3
@@ -136,6 +141,18 @@ def active_snapshots(base: str) -> int:
     st, body = http("GET", base + "/snapshots")
     assert st == 200, body
     return body["active_count"]
+
+
+def backdate_snapshot(db: Path, snapshot_id: str) -> None:
+    """Force a snapshot's expiry into the past (simulates TTL expiry without
+    waiting); the site sweeper reclaims it on its next iteration."""
+    con = sqlite3.connect(db)
+    try:
+        con.execute("UPDATE snapshots SET expires_at = datetime('now', '-1 hour') WHERE id = ?",
+                    (snapshot_id,))
+        con.commit()
+    finally:
+        con.close()
 
 
 def load_cases(db: Path) -> list[tuple[int, str]]:
@@ -317,6 +334,126 @@ def main() -> int:
     coord2_handle[2].join(timeout=20)
     time.sleep(0.5)
     check("H1 graceful stop releases both sites", active_snapshots(A) == 0 and active_snapshots(B) == 0)
+
+    # ---- I. read/reclaim interleaving --------------------------------------
+    # I1: a live snapshot serves complete data (site A seeded 160 cases)
+    st, s_i = http("POST", f"{A}/snapshots", {"round_id": "reclaim-1"})
+    sid_i = s_i["snapshot_id"]
+    st, dd = http("GET", f"{A}/snapshots/{sid_i}/death-days")
+    check("I1 live snapshot returns real death days", st == 200 and len(dd["death_days"]) > 0,
+          f"got {st}: {dd}")
+    st, ag = http("POST", f"{A}/snapshots/{sid_i}/aggregate", {"points": [1]})
+    check("I1b live snapshot returns the full risk set",
+          st == 200 and ag["rows"][0]["n_risk"] == 160, f"got {st}: {ag}")
+
+    # I2: an expired snapshot refuses queries (whether or not the sweeper
+    # has already reclaimed it) instead of answering with empty data
+    backdate_snapshot(db_a, sid_i)
+    st, dd = http("GET", f"{A}/snapshots/{sid_i}/death-days")
+    check("I2 expired snapshot refuses death-days", st == 404, f"got {st}: {dd}")
+    st, ag = http("POST", f"{A}/snapshots/{sid_i}/aggregate", {"points": [1]})
+    check("I2b expired snapshot refuses aggregate", st == 404, f"got {st}: {ag}")
+    time.sleep(3.0)  # let the sweeper reclaim it (sweep interval 2s)
+    st, dd = http("GET", f"{A}/snapshots/{sid_i}/death-days")
+    check("I2c reclaimed snapshot still refuses death-days", st == 404, f"got {st}: {dd}")
+    st, ag = http("POST", f"{A}/snapshots/{sid_i}/aggregate", {"points": [1]})
+    check("I2d reclaimed snapshot still refuses aggregate", st == 404, f"got {st}: {ag}")
+
+    # I3: a released snapshot refuses queries
+    st, s_i3 = http("POST", f"{A}/snapshots", {"round_id": "reclaim-2"})
+    sid_i3 = s_i3["snapshot_id"]
+    http("DELETE", f"{A}/snapshots/{sid_i3}")
+    st, dd = http("GET", f"{A}/snapshots/{sid_i3}/death-days")
+    check("I3 released snapshot refuses death-days", st == 404, f"got {st}: {dd}")
+    st, ag = http("POST", f"{A}/snapshots/{sid_i3}/aggregate", {"points": [1]})
+    check("I3b released snapshot refuses aggregate", st == 404, f"got {st}: {ag}")
+
+    # I4: a read racing a release is always complete-or-refused, never a
+    # partial (zeroed) histogram
+    interleave_ok, interleave_detail = True, ""
+    for i in range(10):
+        st, s_x = http("POST", f"{A}/snapshots", {"round_id": f"race-read-{i}"})
+        sid_x = s_x["snapshot_id"]
+        with cf.ThreadPoolExecutor(max_workers=2) as ex:
+            f_read = ex.submit(http, "POST", f"{A}/snapshots/{sid_x}/aggregate", {"points": [1]})
+            f_del = ex.submit(http, "DELETE", f"{A}/snapshots/{sid_x}")
+            st_r, ag_x = f_read.result()
+            f_del.result()
+        if not (st_r == 404 or (st_r == 200 and ag_x["rows"][0]["n_risk"] == 160)):
+            interleave_ok, interleave_detail = False, f"iter {i}: {st_r} {ag_x}"
+    check("I4 read racing release is complete-or-refused (never zeroed)",
+          interleave_ok, interleave_detail)
+
+    # I5: if a site's snapshot is reclaimed mid-round, the round fails and
+    # no curve is published (the site is never silently counted as zero)
+    COORD3, _coord3_handle = new_coordinator()  # COORD/COORD2 are stopped by now
+    wait_health(COORD3, "coordinator3")
+    st, r = http("POST", f"{COORD3}/rounds")
+    rid_i = r["round_id"]
+    time.sleep(1.0)  # A's snapshot exists; site B is still inside its delay
+    st, lst = http("GET", f"{A}/snapshots")
+    sid_a = [s["snapshot_id"] for s in lst["active"] if s["round_id"] == rid_i][0]
+    backdate_snapshot(db_a, sid_a)  # sweeper reclaims it within ~2s
+    final = wait_final(COORD3, rid_i, timeout=60)
+    check("I5 round fails when a site's snapshot is reclaimed mid-round",
+          final["status"] == "failed", str(final))
+    check("I5b no curve published for the failed round", "result" not in final)
+    check("I5c both sites released after the failure",
+          active_snapshots(A) == 0 and active_snapshots(B) == 0)
+
+    # ---- J. same-round create resend ---------------------------------------
+    # J1: resend while the snapshot is live -> the original snapshot id
+    st, j1a = http("POST", f"{A}/snapshots", {"round_id": "resend-1"})
+    st2, j1b = http("POST", f"{A}/snapshots", {"round_id": "resend-1"})
+    check("J1 resend while live returns the original snapshot id",
+          st == 201 and j1a["snapshot_id"] == j1b["snapshot_id"], f"{j1a} vs {j1b}")
+    check("J1b still exactly one slot occupied", active_snapshots(A) == 1)
+
+    # J2: resend after the snapshot expired -> 409 (no silent swap to a new
+    # snapshot); the slot is reclaimed and usable by a new round
+    backdate_snapshot(db_a, j1a["snapshot_id"])
+    st, j2 = http("POST", f"{A}/snapshots", {"round_id": "resend-1"})
+    check("J2 resend after expiry rejected (409)", st == 409, f"got {st}: {j2}")
+    check("J2b expired snapshot's slot reclaimed", active_snapshots(A) == 0)
+    st, j2c = http("POST", f"{A}/snapshots", {"round_id": "resend-1"})
+    check("J2c resend still rejected via the terminal marker", st == 409, f"got {st}: {j2c}")
+    st, j2d = http("POST", f"{A}/snapshots", {"round_id": "resend-2"})
+    check("J2d freed slot usable by a new round", st == 201, f"got {st}: {j2d}")
+    http("DELETE", f"{A}/snapshots/{j2d['snapshot_id']}")
+
+    # J2e: same when the sweeper (not the create path) reclaimed the snapshot
+    st, j2e = http("POST", f"{A}/snapshots", {"round_id": "resend-x"})
+    backdate_snapshot(db_a, j2e["snapshot_id"])
+    time.sleep(3.0)  # sweeper reclaims it and marks the round terminal
+    st, j2e2 = http("POST", f"{A}/snapshots", {"round_id": "resend-x"})
+    check("J2e resend after sweeper reclaim rejected (409)", st == 409, f"got {st}: {j2e2}")
+
+    # J3: resend after an explicit release -> 409; freed slot serves new rounds
+    st, j3a = http("POST", f"{A}/snapshots", {"round_id": "resend-3"})
+    http("DELETE", f"{A}/snapshots/{j3a['snapshot_id']}")
+    st, j3b = http("POST", f"{A}/snapshots", {"round_id": "resend-3"})
+    check("J3 resend after release rejected (409)", st == 409, f"got {st}: {j3b}")
+    st, j3c = http("POST", f"{A}/snapshots", {"round_id": "resend-4"})
+    check("J3b freed slot usable by a new round", st == 201, f"got {st}: {j3c}")
+    http("DELETE", f"{A}/snapshots/{j3c['snapshot_id']}")
+
+    # J4: rebuild is rejected only within the configured terminal-state
+    # retention window; use a dedicated site with a short retention so the
+    # main sites keep their long default
+    port_c2 = free_port()
+    C2 = f"http://127.0.0.1:{port_c2}"
+    run_server(create_site_app(SiteConfig(
+        site_id="C2", database_url=f"sqlite+aiosqlite:///{TMP / 'site_c2.db'}",
+        seed="C2", seed_cases=10, snapshot_ttl_seconds=60,
+        finalized_retention_seconds=2.0, sweep_interval_seconds=0.5)), port_c2, "site-c2")
+    wait_health(C2, "site-c2")
+    st, k1 = http("POST", f"{C2}/snapshots", {"round_id": "retain-1"})
+    http("DELETE", f"{C2}/snapshots/{k1['snapshot_id']}")
+    st, k2 = http("POST", f"{C2}/snapshots", {"round_id": "retain-1"})
+    check("J4 rebuild rejected within the retention window", st == 409, f"got {st}: {k2}")
+    time.sleep(3.5)  # retention 2s + sweep interval 0.5s
+    st, k3 = http("POST", f"{C2}/snapshots", {"round_id": "retain-1"})
+    check("J4b rebuild allowed after the retention window", st == 201, f"got {st}: {k3}")
 
     print()
     if failures:

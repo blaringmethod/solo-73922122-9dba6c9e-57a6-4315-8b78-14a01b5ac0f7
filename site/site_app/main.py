@@ -43,10 +43,14 @@ def create_app(cfg: SiteConfig) -> FastAPI:
     logger = logging.getLogger(f"site.{cfg.site_id}")
     engine = make_engine(cfg.database_url)
     Session = make_sessionmaker(engine)
-    # Serializes snapshot creation so the slot limit holds under concurrency.
-    # One site process owns its database, so an in-process lock is sufficient
-    # (and works identically on PostgreSQL and SQLite).
-    create_lock = asyncio.Lock()
+    # Serializes every snapshot lifecycle change (create, TTL reclaim, release,
+    # finalize) against every snapshot read (death-days, aggregate). A 200
+    # response therefore always reflects one complete, still-live snapshot: a
+    # snapshot can never be reclaimed halfway through a read and leave the
+    # coordinator adding up a half-deleted histogram as zeros. One site
+    # process owns its database, so an in-process lock is sufficient (and
+    # works identically on PostgreSQL and SQLite).
+    snapshot_lock = asyncio.Lock()
 
     async def maybe_delay() -> None:
         """Emulate a slow hospital node on the compute endpoints (demo)."""
@@ -54,19 +58,30 @@ def create_app(cfg: SiteConfig) -> FastAPI:
             await asyncio.sleep(cfg.response_delay_seconds)
 
     async def sweeper_loop() -> None:
-        """Release expired snapshots so a dead coordinator never holds slots."""
+        """Reclaim expired snapshots so a dead coordinator never holds slots.
+
+        Reclaiming makes the round terminal on this site: within the
+        finalized-retention window the round cannot be rebuilt, so a
+        coordinator retry never silently continues a round on a fresh
+        snapshot. Runs under the snapshot lock so a reclaim never
+        interleaves with an in-flight read of the same snapshot.
+        """
         while True:
             await asyncio.sleep(cfg.sweep_interval_seconds)
             try:
-                async with Session() as s:
-                    now = utcnow()
-                    expired = (await s.scalars(select(Snapshot).where(Snapshot.expires_at <= now))).all()
-                    for snap in expired:
-                        await _delete_snapshot(s, snap)
-                        logger.info("snapshot %s (round %s) expired -> slot released", snap.id, snap.round_id)
-                    cutoff = now - timedelta(seconds=cfg.finalized_retention_seconds)
-                    await s.execute(delete(FinalizedRound).where(FinalizedRound.finalized_at < cutoff))
-                    await s.commit()
+                async with snapshot_lock:
+                    async with Session() as s:
+                        now = utcnow()
+                        expired = (await s.scalars(select(Snapshot).where(Snapshot.expires_at <= now))).all()
+                        for snap in expired:
+                            sid, round_id = snap.id, snap.round_id
+                            await _delete_snapshot(s, snap)
+                            await _mark_finalized(s, round_id, now)
+                            logger.info("snapshot %s (round %s) expired -> slot released, round terminal",
+                                        sid, round_id)
+                        cutoff = now - timedelta(seconds=cfg.finalized_retention_seconds)
+                        await s.execute(delete(FinalizedRound).where(FinalizedRound.finalized_at < cutoff))
+                        await s.commit()
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -100,9 +115,14 @@ def create_app(cfg: SiteConfig) -> FastAPI:
     # helpers
     # ------------------------------------------------------------------ #
     async def get_live_snapshot(s, snapshot_id: str) -> Snapshot:
+        """Fetch a snapshot that is still usable; refuses expired/released ones.
+
+        Must be called under the snapshot lock so the snapshot cannot be
+        reclaimed between this check and the histogram read that follows.
+        """
         snap = await s.get(Snapshot, snapshot_id)
         if snap is None or snap.expires_at <= utcnow():
-            raise HTTPException(status_code=404, detail="snapshot not found or already released")
+            raise HTTPException(status_code=404, detail="snapshot not found, expired, or already released")
         return snap
 
     async def active_count(s, now: datetime) -> int:
@@ -125,14 +145,16 @@ def create_app(cfg: SiteConfig) -> FastAPI:
     async def create_snapshot(body: CreateSnapshotIn):
         """Create a frozen aggregate snapshot for a computation round.
 
-        Idempotent per round: a retry with the same round_id returns the
-        existing snapshot instead of occupying a second slot. Rejected (409)
-        when the round is already finalized (late request) or when both
-        snapshot slots are busy.
+        Idempotent per round while the snapshot is live: a retry with the
+        same round_id returns the existing snapshot instead of occupying a
+        second slot. Rejected (409) when the round is already finalized
+        (late request), when its previous snapshot expired or was released
+        (the round is terminal on this site and must not silently continue
+        on a fresh snapshot), or when both snapshot slots are busy.
         """
         await maybe_delay()
         now = utcnow()
-        async with create_lock:
+        async with snapshot_lock:
             async with Session() as s:
                 if await s.get(FinalizedRound, body.round_id) is not None:
                     raise HTTPException(status_code=409, detail="round already finalized; late snapshot request rejected")
@@ -141,8 +163,19 @@ def create_app(cfg: SiteConfig) -> FastAPI:
                 if existing is not None:
                     if existing.expires_at > now:
                         return snapshot_out(existing, await active_count(s, now))
+                    # The round's previous snapshot expired: reclaim the slot
+                    # and mark the round terminal instead of swapping in a
+                    # fresh snapshot (with a new id) mid-round.
+                    sid = existing.id
                     await _delete_snapshot(s, existing)
-                    await s.flush()
+                    await _mark_finalized(s, body.round_id, now)
+                    await s.commit()
+                    logger.info("snapshot %s (round %s) had expired -> reclaimed; rebuild rejected",
+                                sid, body.round_id)
+                    raise HTTPException(
+                        status_code=409,
+                        detail="snapshot for this round expired; round is terminal on this site",
+                    )
 
                 active = await active_count(s, now)
                 if active >= cfg.max_snapshots:
@@ -174,53 +207,74 @@ def create_app(cfg: SiteConfig) -> FastAPI:
 
     @app.get("/snapshots/{snapshot_id}/death-days")
     async def death_days(snapshot_id: str):
-        """Distinct death days of the frozen snapshot (aggregate information)."""
+        """Distinct death days of the frozen snapshot (aggregate information).
+
+        The liveness check and the histogram read run under the snapshot
+        lock, so a 200 response always comes from one complete snapshot
+        (an empty list means the snapshot genuinely has no deaths). An
+        expired or released snapshot is rejected with 404.
+        """
         await maybe_delay()
-        async with Session() as s:
-            await get_live_snapshot(s, snapshot_id)
-            rows = await s.scalars(
-                select(SnapshotHist.day)
-                .where(SnapshotHist.snapshot_id == snapshot_id, SnapshotHist.deaths > 0)
-                .order_by(SnapshotHist.day)
-            )
-            return {"snapshot_id": snapshot_id, "death_days": list(rows)}
+        async with snapshot_lock:
+            async with Session() as s:
+                await get_live_snapshot(s, snapshot_id)
+                rows = await s.scalars(
+                    select(SnapshotHist.day)
+                    .where(SnapshotHist.snapshot_id == snapshot_id, SnapshotHist.deaths > 0)
+                    .order_by(SnapshotHist.day)
+                )
+                days = list(rows)
+        return {"snapshot_id": snapshot_id, "death_days": days}
 
     @app.post("/snapshots/{snapshot_id}/aggregate")
     async def aggregate(snapshot_id: str, body: AggregateIn):
-        """At-risk and death counts of the frozen snapshot at the given days."""
+        """At-risk and death counts of the frozen snapshot at the given days.
+
+        Same completeness guarantee as death-days: a 200 response is always
+        computed from the full frozen histogram of a live snapshot.
+        """
         await maybe_delay()
         points = sorted(set(body.points))
         if any(p <= 0 for p in points):
             raise HTTPException(status_code=422, detail="points must be positive integers (days)")
-        async with Session() as s:
-            await get_live_snapshot(s, snapshot_id)
-            hist = (
-                await s.execute(
-                    select(SnapshotHist.day, SnapshotHist.deaths, SnapshotHist.censored).where(
-                        SnapshotHist.snapshot_id == snapshot_id
+        async with snapshot_lock:
+            async with Session() as s:
+                await get_live_snapshot(s, snapshot_id)
+                hist = (
+                    await s.execute(
+                        select(SnapshotHist.day, SnapshotHist.deaths, SnapshotHist.censored).where(
+                            SnapshotHist.snapshot_id == snapshot_id
+                        )
                     )
-                )
-            ).all()
+                ).all()
         return {"snapshot_id": snapshot_id, "rows": risk_rows(hist, points)}
 
     @app.delete("/snapshots/{snapshot_id}", status_code=204)
     async def delete_snapshot(snapshot_id: str):
-        """Release a snapshot (idempotent)."""
-        async with Session() as s:
-            snap = await s.get(Snapshot, snapshot_id)
-            if snap is not None:
-                await _delete_snapshot(s, snap)
-                await s.commit()
-                logger.info("snapshot %s released", snapshot_id)
+        """Release a snapshot (idempotent).
+
+        Releasing makes the round terminal on this site: within the
+        finalized-retention window the round cannot be rebuilt, while the
+        freed slot is immediately usable by a new round.
+        """
+        async with snapshot_lock:
+            async with Session() as s:
+                snap = await s.get(Snapshot, snapshot_id)
+                if snap is not None:
+                    sid, round_id = snap.id, snap.round_id
+                    await _delete_snapshot(s, snap)
+                    await _mark_finalized(s, round_id, utcnow())
+                    await s.commit()
+                    logger.info("snapshot %s released (round %s terminal on this site)", sid, round_id)
         return Response(status_code=204)
 
     @app.post("/rounds/{round_id}/finalize")
     async def finalize_round(round_id: str):
         """Mark a round as terminal: delete its snapshots and reject late creates."""
-        # create_lock makes this atomic w.r.t. snapshot creation: either a
+        # snapshot_lock makes this atomic w.r.t. snapshot creation: either a
         # create commits first (and its snapshot is deleted here) or the
         # finalize commits first (and the create is rejected with 409).
-        async with create_lock:
+        async with snapshot_lock:
             async with Session() as s:
                 if await s.get(FinalizedRound, round_id) is None:
                     s.add(FinalizedRound(round_id=round_id, finalized_at=utcnow()))
@@ -260,6 +314,13 @@ def create_app(cfg: SiteConfig) -> FastAPI:
 async def _delete_snapshot(s, snap: Snapshot) -> None:
     await s.execute(delete(SnapshotHist).where(SnapshotHist.snapshot_id == snap.id))
     await s.delete(snap)
+
+
+async def _mark_finalized(s, round_id: str, when: datetime) -> None:
+    """Record a round as terminal (idempotent): snapshot creates for it are
+    rejected while the marker is retained (finalized_retention_seconds)."""
+    if await s.get(FinalizedRound, round_id) is None:
+        s.add(FinalizedRound(round_id=round_id, finalized_at=when))
 
 
 # Module-level app used by `uvicorn site_app.main:app` (Docker, CLI).

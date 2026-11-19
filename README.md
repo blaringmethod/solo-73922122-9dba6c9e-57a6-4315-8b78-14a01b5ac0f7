@@ -60,6 +60,8 @@ curl -s -X POST localhost:8000/rounds/$RID/cancel
   **同日死亡先于删失**：t 日删失者仍计入 t 日风险集（标准 KM 约定）。
 - 生存率递推：`S(t) = S(t_prev) × (1 − d(t)/n_risk(t))`，`S(0)=1`。
 - **两院齐备才发布**：只有两轮聚合都完成、曲线算完，`GET /rounds/{id}` 才会带 `result`。
+  任一院在计算途中报告快照不可用（404/409）或请求失败，本轮立即失败，**不发布曲线**——
+  绝不会把联系不上的院当成零人计入。
 
 ## 轮次状态与资源释放保证
 
@@ -67,9 +69,17 @@ curl -s -X POST localhost:8000/rounds/$RID/cancel
 
 - **取消或任一院失败即停止整轮**：剩余步骤不再执行；协调端先在两院释放快照并
   `finalize` 本轮，**然后**才发布终态（自测逐条验证了这一先后顺序）。
+- **读取与回收互斥**：院端把快照的创建/回收/释放/finalize 与死亡日、风险人数查询
+  经同一把进程内锁串行化。查询的成功响应必来自一份**完整快照**（确实没有数据时仍返回
+  空列表/零计数）；快照绝不可能在读取途中被回收而留下半截直方图。
+- **已过期或已释放的快照拒绝查询**：一律 404，绝不返回空数据冒充成功。
+- **快照过期/释放即本院终态**：快照被 TTL 回收或主动释放后，原 `round_id` 在
+  `FINALIZED_RETENTION_SECONDS`（默认 86400s）保留期内拒绝重建（409）——
+  协调端重发建快照请求不会给同一轮换上新快照；腾出的槽位立即可供**新轮**使用，
+  保留期过后原轮标识才允许再次建快照。
 - **终态后迟到的建快照请求不得占用**：院端记录已 finalize 的 round_id，迟到请求直接 409，不占槽位。
-- **每院最多 2 个活动快照**：第 3 个请求 409；建快照按 round_id 幂等（重试返回同一快照，不重复占槽）；
-  创建经进程内异步锁串行化，并发下槽位上限依然严格成立（10 并发实测仅 2 个成功）。
+- **每院最多 2 个活动快照**：第 3 个请求 409；快照有效时按 round_id 幂等（重试返回同一快照，
+  不重复占槽）；创建经进程内异步锁串行化，并发下槽位上限依然严格成立（10 并发实测仅 2 个成功）。
 - **协调端退出后占用自动释放**：快照带 TTL（默认 300s，可配），院端后台清扫器到期即释放；
   优雅停机（`docker compose stop`）时协调端也会主动取消在途轮次并释放两院。
 - **重启不续算**：协调端重启时把 `running/cancelling` 的轮次标记为
@@ -113,10 +123,10 @@ docker compose exec site-a-db psql -U sitea -d site_a \
 
 | 方法/路径 | 说明 |
 |---|---|
-| `POST /snapshots` `{round_id}` | 建快照（幂等/槽位满 409/已终态 409） |
-| `GET /snapshots/{id}/death-days` | 该快照的死亡日列表 |
-| `POST /snapshots/{id}/aggregate` `{points:[..]}` | 各点的 n_risk 与 d |
-| `DELETE /snapshots/{id}` | 释放快照（幂等 204） |
+| `POST /snapshots` `{round_id}` | 建快照（有效时幂等返回原标识；槽位满 409；已终态/已过期/已释放的同轮请求 409） |
+| `GET /snapshots/{id}/death-days` | 该快照的死亡日列表（过期/已释放 404） |
+| `POST /snapshots/{id}/aggregate` `{points:[..]}` | 各点的 n_risk 与 d（过期/已释放 404） |
+| `DELETE /snapshots/{id}` | 释放快照（幂等 204）；该轮随即进入本院终态 |
 | `POST /rounds/{round_id}/finalize` | 标记终态：删除本轮快照、拒绝迟到建快照 |
 | `GET /snapshots` | 活动槽位（仅标识与过期时间） |
 | `GET /health`、`/docs` | 健康检查、Swagger 文档 |
@@ -127,9 +137,11 @@ docker compose exec site-a-db psql -U sitea -d site_a \
 `SITE_CLEANUP_TIMEOUT`(5s)、`SHUTDOWN_TIMEOUT`(15s)。
 
 院端：`SITE_ID`、`DATABASE_URL`、`MAX_SNAPSHOTS`(2)、`SNAPSHOT_TTL_SECONDS`(300)、
-`RESPONSE_DELAY_SECONDS`(0)、`SEED`、`SEED_CASES`(≤200)、`SWEEP_INTERVAL_SECONDS`(2)。
+`RESPONSE_DELAY_SECONDS`(0)、`SEED`、`SEED_CASES`(≤200)、`SWEEP_INTERVAL_SECONDS`(2)、
+`FINALIZED_RETENTION_SECONDS`(86400，快照过期/释放后拒绝为原轮重建的保留期)。
 
-> 注意：`SNAPSHOT_TTL_SECONDS` 需大于最慢一轮的耗时，否则院端会在计算途中回收快照导致整轮失败。
+> 注意：`SNAPSHOT_TTL_SECONDS` 需大于最慢一轮的耗时，否则院端会在计算途中回收快照。
+> 回收不会导致错误结果——该轮查询会被拒绝、整轮失败且不发布曲线——但轮次会白白浪费。
 
 ## 自测
 
@@ -144,8 +156,14 @@ python tests/integration_postgres.py     # 嵌入式 PostgreSQL：并发槽位�
 `integration_local.py` 覆盖：成功路径曲线与独立计算逐点对拍、运行中不发布结果、
 慢院下查询/取消即时、取消与失败均先释放两院再报终态、槽位上限、迟到建快照拒绝、
 幂等建快照、计算中直连 SQL 更正不被阻塞、协调端崩溃后 TTL 自动释放、重启恢复、
-优雅停机释放。`integration_postgres.py` 另覆盖：10 并发抢 2 槽位、PostgreSQL 下曲线对拍、
-200 例上限触发器。
+优雅停机释放、**读取与回收交错（查询要么拿到完整快照要么 404，绝不出现半截数据）、
+轮中快照被回收则整轮失败不发布、同轮重发（有效时返回原标识，过期/释放后 409，
+槽位腾出供新轮，保留期过后才允许原轮重建）**。
+`integration_postgres.py` 另覆盖：10 并发抢 2 槽位、PostgreSQL 下曲线对拍、
+200 例上限触发器、READ COMMITTED 下读取/释放交错的完整性、同轮重发拒绝。
+
+一键演示修复行为：`scripts/demo_snapshot_reclaim.sh`（释放后查询被拒、同轮重建被拒、
+槽位供新轮、轮中回收则整轮失败）。
 
 ## 已知限制
 
